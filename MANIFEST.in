@@ -1,0 +1,3 @@
+include tinylemmatizer.c tinylemmatizer.h cstlempy.pyx launch.py
+recursive-include tests *.py flexrules.en
+exclude cstlempy.c

@@ -11,9 +11,15 @@
 
 #include "tinylemmatizer.h"
 
+struct tlRules
+    {
+    char* buf;
+    long buflen;
+    };
+
+// State for the old single-instance API (startProc, stringEval, endProc)
+static tlRules* legacyRules = 0;
 static char* result = 0;
-static char* buf = 0;
-static long buflen = 0;
 
 typedef struct LemmaRule
     {
@@ -209,7 +215,8 @@ static char* rewrite(const char** pword, const char** pwordend, const char* p)
 
 static LemmaRule* addLemma(LemmaRule* lemmas, lemmaCandidate* lemma)
     {
-    if (lemma->L)
+    // lemma is 0 if no rule matches at the top level, e.g. for an empty word
+    if (lemma && lemma->L)
         {
         if (lemmas)
             {
@@ -453,72 +460,127 @@ static LemmaRule* pruneEquals(LemmaRule* L)
     return L;
     }
 
-static const char* apply(const char* word
-    , const char* buf
-    , const char* maxpos
-)
+static LemmaRule* apply(const tlRules* rules, const char* word)
     {
-    size_t len = strlen(word);
-    free(result);
-    result = 0;
-    LemmaRule* lemmas = 0;
-    result = concat(pruneEquals(newStyleLemmatizeV3(word, word + len, buf, maxpos, 0, lemmas)));
-    return result;
+    if (!rules)
+        return 0;
+    LemmaRule* lemmas = newStyleLemmatizeV3(word, word + strlen(word), rules->buf, rules->buf + rules->buflen, 0, 0);
+    return lemmas ? pruneEquals(lemmas) : 0;
     }
 
-
-static const char* applyRules(const char* word)
+static tlRules* allocRules(long buflen)
     {
-    if (buf)
-        return apply(word, buf, buf + buflen);
+    tlRules* rules = (tlRules*)malloc(sizeof(tlRules));
+    if (!rules)
+        return 0;
+    rules->buf = (char*)malloc(buflen + 1);
+    if (!rules->buf)
+        {
+        free(rules);
+        return 0;
+        }
+    rules->buflen = buflen;
+    rules->buf[buflen] = '\0';
+    return rules;
+    }
+
+tlRules* tlNewRules(const char* data, long size)
+    {
+    // The first int in a flexrules file is not part of the rules.
+    if (size <= (long)sizeof(int))
+        return 0;
+    tlRules* rules = allocRules(size - sizeof(int));
+    if (rules)
+        memcpy(rules->buf, data + sizeof(int), rules->buflen);
+    return rules;
+    }
+
+int tlReadRules(const char* filename, tlRules** out)
+    {
+    *out = 0;
+    FILE* flexrulefile = fopen(filename, "rb");
+    if (!flexrulefile)
+        return 1;
+    fseek(flexrulefile, 0, SEEK_END);
+    long buflen = ftell(flexrulefile) - (long)sizeof(int);
+    fseek(flexrulefile, sizeof(int), SEEK_SET);
+    tlRules* rules = buflen > 0 ? allocRules(buflen) : 0;
+    if (!rules || fread(rules->buf, 1, buflen, flexrulefile) != (size_t)buflen)
+        {
+        tlFreeRules(rules);
+        fclose(flexrulefile);
+        return 2;
+        }
+    fclose(flexrulefile);
+    *out = rules;
     return 0;
     }
 
-int readRules(const char* filename)
+void tlFreeRules(tlRules* rules)
     {
-    FILE* flexrulefile = fopen(filename, "rb");
-    if (flexrulefile)
+    if (rules)
         {
-        fseek(flexrulefile, 0, SEEK_END);
-        buflen = ftell(flexrulefile);
-        fseek(flexrulefile, sizeof(int), SEEK_SET);
-        buflen -= sizeof(int);
-        buf = (char*)malloc(buflen + 1);
-        if (buf && buflen > 0)
-            {
-            if (fread(buf, 1, buflen, flexrulefile) != (size_t)buflen)
-                {
-                fclose(flexrulefile);
-                return 2;
-                }
-            buf[buflen] = '\0';
-            }
-        fclose(flexrulefile);
-        return 0;
+        free(rules->buf);
+        free(rules);
         }
-    return 1;
+    }
+
+char** tlLemmas(const tlRules* rules, const char* word)
+    {
+    LemmaRule* L = apply(rules, word);
+    if (!L)
+        return 0;
+    int n = 0;
+    while (L[n].Lem)
+        ++n;
+    char** lemmas = (char**)malloc((n + 1) * sizeof(char*));
+    if (lemmas)
+        {
+        for (int i = 0; i <= n; ++i)
+            lemmas[i] = (char*)L[i].Lem;
+        }
+    else
+        {
+        for (int i = 0; i < n; ++i)
+            free((void*)L[i].Lem);
+        }
+    free(L);
+    return lemmas;
+    }
+
+void tlFreeLemmas(char** lemmas)
+    {
+    if (lemmas)
+        {
+        for (int i = 0; lemmas[i]; ++i)
+            free(lemmas[i]);
+        free(lemmas);
+        }
     }
 
 void startProc(const char* flexrulesFileName, int* err)
     {
-    *err = readRules(flexrulesFileName);
+    endProc();
+    *err = tlReadRules(flexrulesFileName, &legacyRules);
     }
 
 void stringEval(const char* s, const char** out, int* err)
     {
-    *out = applyRules(s);
+    free(result);
+    result = concat(apply(legacyRules, s));
+    *out = result;
     *err = 0;
     }
 
 void endProc(void)
     {
     free(result);
-    free(buf);
+    tlFreeRules(legacyRules);
     result = 0;
-    buf = 0;
-    buflen = 0;
+    legacyRules = 0;
     }
 
+#ifndef PYTHONINTERFACE
 int main(int argc, char ** argv)
     {
     const char* res = 0;
@@ -538,14 +600,15 @@ int main(int argc, char ** argv)
                 if (fullform)
                     {
                     stringEval(fullform, &res, &err);
-                    printf("%s\n",res);
+                    printf("%s\n",res ? res : "");
                     }
                 else
                     {
                     while (1)
                         {
                         char string[20];
-                        fgets(string, sizeof(string), stdin);
+                        if(fgets(string, sizeof(string), stdin) == 0)
+                            break;
                         while (1)
                             {
                             long L = (long)strlen(string) - 1;
@@ -576,3 +639,4 @@ int main(int argc, char ** argv)
         }
     return 0;
     }
+#endif
